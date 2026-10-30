@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI语音日记</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>">
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div id="app" v-cloak>
+  <header class="topbar">
+    <div class="brand">🎙️ AI语音日记</div>
+    <nav v-if="configured" class="nav" aria-label="主导航">
+      <a href="#/diary" :class="{active: view==='diary'}">日记</a>
+      <a href="#/qa" :class="{active: view==='qa'}">问答</a>
+      <a href="#/settings" :class="{active: view==='settings'}">设置</a>
+    </nav>
+  </header>
+
+  <div class="toast" v-if="toast.text" :class="toast.type" role="status" aria-live="polite">{{ toast.text }}</div>
+
+  <!-- ============ 首次配置 / 设置 ============ -->
+  <main v-if="view==='setup' || view==='settings'" class="page narrow">
+    <section class="card">
+      <h1 v-if="view==='setup'">欢迎使用 AI语音日记</h1>
+      <h1 v-else>设置</h1>
+      <p class="muted" v-if="view==='setup'">日记只保存在你的电脑上。语音识别和总结需要两个 API Key,填好后点“测试连接”。</p>
+
+      <label class="field">
+        <span>日记存储位置</span>
+        <div class="row">
+          <input v-model="form.data_path" placeholder="例如 D:\我的日记" aria-label="日记存储位置">
+          <button class="btn" @click="pickFolder" :disabled="busy.pick">选择…</button>
+        </div>
+        <small class="muted">每天的日记保存为该目录下 diaries/YYYY-MM-DD.md</small>
+      </label>
+
+      <label class="field">
+        <span>DeepSeek API Key <small class="muted">(总结 + 问答)</small></span>
+        <input v-model="form.deepseek_key" type="password" autocomplete="off"
+               :placeholder="status.has_deepseek_key ? '已保存,留空则不修改' : 'sk-...'">
+        <small class="muted">在 platform.deepseek.com 的 “API keys” 页面创建</small>
+      </label>
+
+      <label class="field">
+        <span>阿里云百炼 DashScope API Key <small class="muted">(语音识别 + 向量检索)</small></span>
+        <input v-model="form.dashscope_key" type="password" autocomplete="off"
+               :placeholder="status.has_dashscope_key ? '已保存,留空则不修改' : 'sk-...'">
+        <small class="muted">在 bailian.console.aliyun.com 的 “API-KEY” 页面创建</small>
+      </label>
+
+      <div class="test-result" v-if="testResult" aria-live="polite">
+        <div :class="testResult.deepseek_ok ? 'ok' : 'bad'">DeepSeek: {{ testResult.deepseek_ok ? '连接成功' : testResult.deepseek_error }}</div>
+        <div :class="testResult.dashscope_ok ? 'ok' : 'bad'">DashScope: {{ testResult.dashscope_ok ? '连接成功' : testResult.dashscope_error }}</div>
+      </div>
+
+      <div class="actions">
+        <button class="btn" @click="testConfig" :disabled="busy.test">{{ busy.test ? '测试中…' : '测试连接' }}</button>
+        <button class="btn primary" @click="saveConfig" :disabled="busy.save">{{ busy.save ? '保存中…' : '保存' }}</button>
+      </div>
+    </section>
+
+    <section class="card" v-if="view==='settings'">
+      <h2>知识库</h2>
+      <p class="muted">问答时会自动同步日记文件的改动。已索引 {{ indexCount }} 条记录。</p>
+      <div class="actions">
+        <button class="btn" @click="rebuildIndex" :disabled="busy.rebuild">{{ busy.rebuild ? '同步中…' : '立即同步索引' }}</button>
+        <button class="btn" @click="openFolder">打开日记文件夹</button>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ 日记 ============ -->
+  <main v-if="view==='diary'" class="page diary">
+    <aside class="left">
+      <section class="card recorder">
+        <button class="rec-btn" :class="rec.state" @click="toggleRecord" :disabled="rec.state==='processing'"
+                :aria-label="rec.state==='recording' ? '停止录音' : '开始录音'">
+          <span v-if="rec.state==='processing'" class="spinner" aria-hidden="true"></span>
+          <span v-else>{{ rec.state==='recording' ? '■' : '🎤' }}</span>
+        </button>
+        <div class="rec-status" aria-live="polite">
+          <template v-if="rec.state==='idle'">点击开始录音</template>
+          <template v-else-if="rec.state==='recording'">录音中 {{ fmtSeconds(rec.seconds) }} / {{ fmtSeconds(maxSeconds) }}</template>
+          <template v-else>正在识别并总结…</template>
+        </div>
+        <div class="level" v-if="rec.state==='recording'"><div :style="{width: (rec.level*100)+'%'}"></div></div>
+      </section>
+
+      <section class="card calendar">
+        <div class="cal-head">
+          <button class="icon" @click="shiftMonth(-1)" aria-label="上个月">‹</button>
+          <strong>{{ cal.year }}年{{ cal.month }}月</strong>
+          <button class="icon" @click="shiftMonth(1)" aria-label="下个月">›</button>
+        </div>
+        <div class="cal-grid">
+          <div class="wd" v-for="w in ['一','二','三','四','五','六','日']" :key="w">{{ w }}</div>
+          <div v-for="(c, i) in calCells" :key="i" class="cell-wrap">
+            <button v-if="c" class="cell" :class="{has: c.count, today: c.date===today, sel: c.date===selectedDate}"
+                    @click="selectDate(c.date)" :aria-label="c.date + (c.count ? ',' + c.count + '条记录' : '')">
+              {{ c.day }}<span v-if="c.count" class="dot">{{ c.count }}</span>
+            </button>
+          </div>
+        </div>
+        <button class="btn small" @click="goToday">回到今天</button>
+      </section>
+    </aside>
+
+    <section class="right">
+      <div class="card search">
+        <input v-model="search.q" @keyup.enter="doSearch" placeholder="搜索日记内容、人物、地点…" aria-label="搜索关键词">
+        <select v-model="search.tag" aria-label="按标签筛选">
+          <option value="">全部标签</option>
+          <option v-for="t in tags" :key="t.tag" :value="t.tag">{{ t.tag }} ({{ t.count }})</option>
+        </select>
+        <input type="date" v-model="search.start" aria-label="开始日期">
+        <input type="date" v-model="search.end" aria-label="结束日期">
+        <button class="btn primary" @click="doSearch">搜索</button>
+        <button class="btn" v-if="search.active" @click="clearSearch">清除</button>
+      </div>
+
+      <div class="card last-result" v-if="lastResult">
+        <div class="lr-head">
+          <strong>✅ 已保存到 {{ lastResult.entry.date }} {{ lastResult.entry.time }}</strong>
+          <button class="icon" @click="lastResult=null" aria-label="关闭">×</button>
+        </div>
+        <p v-if="!lastResult.indexed" class="warn">日记已保存,但知识库索引暂时失败({{ lastResult.index_error }}),下次问答时会自动补上。</p>
+        <details>
+          <summary>查看本次识别原文(不会保存)</summary>
+          <p class="transcript">{{ lastResult.transcript }}</p>
+        </details>
+      </div>
+
+      <template v-if="search.active">
+        <h2 class="section-title">搜索结果 {{ search.results.length }} 条</h2>
+        <p class="muted" v-if="!search.results.length">没有匹配的记录</p>
+        <article class="card entry clickable" v-for="e in search.results" :key="e.id" @click="jumpTo(e.date)"
+                 tabindex="0" @keyup.enter="jumpTo(e.date)">
+          <div class="entry-head"><span class="time">{{ e.date }} {{ e.time }}</span><span>{{ emoji(e.entities.emotion) }}</span></div>
+          <p class="summary">{{ e.summary }}</p>
+          <div class="tags"><span class="tag" v-for="t in e.tags" :key="t">{{ t }}</span></div>
+        </article>
+      </template>
+
+      <template v-else>
+        <div class="day-head">
+          <h2 class="section-title">{{ fmtDate(selectedDate) }}</h2>
+          <button class="btn small" v-if="dayEntries.length" @click="printDay">导出 PDF</button>
+        </div>
+        <p class="muted empty" v-if="!dayEntries.length">这一天还没有记录</p>
+        <article class="card entry" v-for="e in dayEntries" :key="e.id">
+          <div class="entry-head">
+            <span class="time">🕐 {{ e.time }}</span>
+            <span class="emotion">{{ emoji(e.entities.emotion) }} {{ e.entities.emotion }}</span>
+            <span class="spacer"></span>
+            <template v-if="editing.id!==e.id">
+              <button class="icon" @click="startEdit(e)" aria-label="编辑">✏️</button>
+              <button class="icon" @click="removeEntry(e)" aria-label="删除">🗑️</button>
+            </template>
+          </div>
+          <template v-if="editing.id===e.id">
+            <textarea v-model="editing.summary" rows="5" aria-label="总结"></textarea>
+            <input v-model="editing.tags" placeholder="标签,空格分隔" aria-label="标签">
+            <div class="actions">
+              <button class="btn" @click="editing.id=null">取消</button>
+              <button class="btn primary" @click="saveEdit(e)">保存</button>
+            </div>
+          </template>
+          <template v-else>
+            <p class="summary">{{ e.summary }}</p>
+            <div class="tags"><span class="tag" v-for="t in e.tags" :key="t">{{ t }}</span></div>
+            <dl class="entities">
+              <template v-if="e.entities.people && e.entities.people.length"><dt>人物</dt><dd>{{ e.entities.people.join('、') }}</dd></template>
+              <template v-if="e.entities.places && e.entities.places.length"><dt>地点</dt><dd>{{ e.entities.places.join('、') }}</dd></template>
+              <template v-if="e.entities.events && e.entities.events.length"><dt>事项</dt><dd>{{ e.entities.events.join('、') }}</dd></template>
+            </dl>
+          </template>
+        </article>
+      </template>
+    </section>
+  </main>
+
+  <!-- ============ 问答 ============ -->
+  <main v-if="view==='qa'" class="page qa">
+    <aside class="conv-list card">
+      <button class="btn primary block" @click="newConv">+ 新对话</button>
+      <ul>
+        <li v-for="c in convs" :key="c.id" :class="{active: c.id===activeConvId}">
+          <button class="conv-title" @click="activeConvId=c.id; activeMsgIdx=null">{{ c.title || '新对话' }}</button>
+          <button class="icon" @click="deleteConv(c.id)" aria-label="删除对话">×</button>
+        </li>
+      </ul>
+    </aside>
+
+    <section class="chat card">
+      <div class="messages" ref="messages">
+        <div class="hint" v-if="!activeConv || !activeConv.messages.length">
+          <p>你的日记就是知识库,试着问问:</p>
+          <button class="chip" v-for="q in sampleQuestions" :key="q" @click="ask(q)">{{ q }}</button>
+        </div>
+        <div v-for="(m, i) in (activeConv ? activeConv.messages : [])" :key="i" class="msg" :class="m.role">
+          <div class="bubble" :class="{selected: i===activeMsgIdx}" @click="m.role==='assistant' && (activeMsgIdx=i)">
+            <template v-for="(seg, k) in segments(m.content)" :key="k">
+              <button v-if="seg.cite" class="cite" @click.stop="showSource(i, seg.cite)"
+                      :aria-label="'查看来源' + seg.cite">{{ seg.cite }}</button>
+              <span v-else>{{ seg.text }}</span>
+            </template>
+            <span v-if="m.pending && !m.content" class="typing">正在翻日记…</span>
+            <div v-if="m.error" class="bad">{{ m.error }}</div>
+            <div v-if="m.role==='assistant' && !m.pending && m.sources && m.sources.length" class="src-count">
+              引用 {{ (m.cited || []).length }} 条 · 检索 {{ m.sources.length }} 条
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="composer">
+        <textarea v-model="question" rows="2" placeholder="问问你的日记…(Enter 发送,Shift+Enter 换行)"
+                  @keydown.enter="onEnter" aria-label="输入问题"></textarea>
+        <button v-if="asking" class="btn" @click="stopAsk">停止</button>
+        <button v-else class="btn primary" @click="ask()" :disabled="!question.trim()">发送</button>
+      </div>
+    </section>
+
+    <aside class="sources card" aria-label="引用来源">
+      <h3>引用来源</h3>
+      <p class="muted" v-if="!activeMsg || !activeMsg.sources || !activeMsg.sources.length">点击回答中的序号查看对应日记原文</p>
+      <template v-else>
+        <article v-for="s in activeMsg.sources" :key="s.id" class="src"
+                 :class="{cited: (activeMsg.cited||[]).includes(s.index), focus: s.index===activeSource}"
+                 :id="'src-' + s.index">
+          <div class="src-head">
+            <span class="cite static">{{ s.index }}</span>
+            <a href="#" @click.prevent="jumpTo(s.date)">📅 {{ s.date }} {{ s.time }}</a>
+            <span class="score" :title="'相似度 ' + s.score">{{ Math.round(s.score*100) }}%</span>
+          </div>
+          <p>{{ s.summary }}</p>
+          <div class="tags"><span class="tag" v-for="t in s.tags" :key="t">{{ t }}</span></div>
+        </article>
+      </template>
+    </aside>
+  </main>
+</div>
+
+<script src="/static/vendor/vue.global.prod.js"></script>
+<script src="/static/js/recorder.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>
